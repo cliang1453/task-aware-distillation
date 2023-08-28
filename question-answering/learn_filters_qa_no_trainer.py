@@ -138,19 +138,7 @@ def parse_args():
         "--model_name_or_path",
         type=str,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
-        required=False,
-    )
-    parser.add_argument(
-        "--config_name",
-        type=str,
-        default=None,
-        help="Pretrained config name or path if not the same as model_name",
-    )
-    parser.add_argument(
-        "--tokenizer_name",
-        type=str,
-        default=None,
-        help="Pretrained tokenizer name or path if not the same as model_name",
+        required=True,
     )
     parser.add_argument(
         "--use_slow_tokenizer",
@@ -449,37 +437,14 @@ def main():
     # download model & vocab.
     config_class = CONFIG_MAPPING[args.model_type] # args.model_type is required argument specifying the TED architecture. you can defined your own.
     model_class = MODEL_MAPPING.get(config_class, default=None)
-
-    if args.config_name:
-        config = config_class.from_pretrained(
-            args.config_name,
-            train_filters=True,
-            filter_interval=args.filter_interval,
-            filter_output_dim=args.filter_output_dim,
-            filter_nonlinear=args.filter_nonlinear
-        )
-    elif args.model_name_or_path:
-        config = config_class.from_pretrained(
-            args.model_name_or_path,
-            train_filters=True,
-            filter_interval=args.filter_interval,
-            filter_output_dim=args.filter_output_dim,
-            filter_nonlinear=args.filter_nonlinear
-        )
-    else:
-        logger.warning("You are instantiating a new config instance from scratch.")
-        config = config_class()
-
-    if args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=True)
-    elif args.model_name_or_path:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
-    else:
-        raise ValueError(
-            "You are instantiating a new tokenizer from scratch. This is not supported by this script."
-            "You can do it from another script, save it, and load it from here, using --tokenizer_name."
-        )
-    
+    config = config_class.from_pretrained(
+        args.model_name_or_path,
+        train_filters=True,
+        filter_interval=args.filter_interval,
+        filter_output_dim=args.filter_output_dim,
+        filter_nonlinear=args.filter_nonlinear
+    )
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
     if args.checkpoint_path:
         logger.info(f"You are learning filters for checkpoint in {args.checkpoint_path}. "
                     f"Please make sure it is properly initialized on the target task.")
@@ -488,18 +453,14 @@ def main():
             from_tf=bool(".ckpt" in args.checkpoint_path),
             config=config,
         )
-    elif args.model_name_or_path:
-        logger.info(f"You are learning filters for {args.model_name_or_path}. "
+    else:
+        logger.info(f"You are learning filters for checkpoint in {args.model_name_or_path}. "
                     f"Please make sure it is properly initialized on the target task.")
         model = model_class.from_pretrained(
             args.model_name_or_path,
             from_tf=bool(".ckpt" in args.model_name_or_path),
             config=config,
         )
-    else:
-        logger.warning(f"You are learning filters for an untrained model. "
-                       f"Please consider using a properly initialized model.")
-        model = model_class.from_config(config)
 
     # Preprocessing the datasets.
     # Preprocessing is slighlty different for training and evaluation.

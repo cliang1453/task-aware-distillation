@@ -27,13 +27,17 @@ from transformers.activations import ACT2FN
 from transformers.modeling_outputs import (
     BaseModelOutput,
     QuestionAnsweringModelOutput,
+    SequenceClassifierOutput,
 )
 
 from transformers.models.deberta_v2.modeling_deberta_v2 import (
     DebertaV2ForQuestionAnswering,
+    DebertaV2ForSequenceClassification,
     DebertaV2Model,
     DebertaV2Encoder,
     DebertaV2Layer,
+    ContextPooler,
+    StableDropout,
 )
 
 @dataclass
@@ -44,15 +48,20 @@ class TEDBaseModelOutput(BaseModelOutput):
 class TEDQuestionAnsweringModelOutput(QuestionAnsweringModelOutput):
     filter_states: Tuple[torch.FloatTensor] = None
 
+@dataclass
+class TEDSequenceClassifierOutput(SequenceClassifierOutput):
+    filter_states: Tuple[torch.FloatTensor] = None
+
 class TEDDebertaV2Layer(DebertaV2Layer):
     def __init__(self, config, layer_idx=None):
         super().__init__(config)
         
         assert layer_idx is not None
         self.should_add_filter = (
-            (layer_idx < config.num_hidden_layers//2 and layer_idx % config.filter_interval == 0) 
-            or (layer_idx >= config.num_hidden_layers//2 and layer_idx % config.filter_interval == config.filter_interval - 1)
-        )
+            # (layer_idx < config.num_hidden_layers//2 and layer_idx % config.filter_interval == 0) 
+            # or (layer_idx >= config.num_hidden_layers//2 and layer_idx % config.filter_interval == config.filter_interval - 1)
+            (layer_idx + 1) % config.filter_interval == 0
+        ) and not config.filter_disabled
         
         if self.should_add_filter:
             filter_output_dim = config.filter_output_dim if config.filter_output_dim else config.hidden_size
@@ -379,6 +388,155 @@ class TEDDebertaV2ForQuestionAnswering(DebertaV2ForQuestionAnswering):
             start_logits=start_logits,
             end_logits=end_logits,
             hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            filter_states=outputs.filter_states,
+        )
+
+class TEDContextPooler(ContextPooler):
+    def __init__(self, config):
+        super().__init__(config)
+        pooler_output_dim = self.config.filter_output_dim if self.config.filter_output_dim is not None else self.config.pooler_hidden_size
+        self.dense = nn.Linear(pooler_output_dim, pooler_output_dim)
+    
+    @property
+    def output_dim(self):
+        return self.config.filter_output_dim if self.config.filter_output_dim is not None else self.config.hidden_size
+
+class TEDDebertaV2ForSequenceClassification(DebertaV2ForSequenceClassification):
+    def __init__(self, config):
+        super().__init__(config)
+
+        self.deberta = TEDDebertaV2Model(config)
+        if config.train_filters:
+            self.num_filters = config.num_hidden_layers // config.filter_interval
+            self.filter_pooler = nn.ModuleList([
+                TEDContextPooler(config) for _ in range(self.num_filters)
+            ])
+            filter_output_dim = self.filter_pooler[0].output_dim
+            self.filter_head = nn.ModuleList([
+                nn.Linear(filter_output_dim, self.num_labels) for _ in range(self.num_filters)
+            ])
+            drop_out = getattr(config, "cls_dropout", None)
+            drop_out = self.config.hidden_dropout_prob if drop_out is None else drop_out
+            self.filter_dropout = nn.ModuleList([
+                StableDropout(drop_out) for _ in range(self.num_filters)
+            ])
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        token_type_ids: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, SequenceClassifierOutput]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.deberta(
+            input_ids,
+            token_type_ids=token_type_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        if not self.config.train_filters:
+            encoder_layer = outputs[0]
+            pooled_output = self.pooler(encoder_layer)
+            pooled_output = self.dropout(pooled_output)
+            logits = self.classifier(pooled_output)
+        else:
+            logits = None
+            filter_logits = []
+            for filter_idx in range(self.num_filters):
+                filter_pooled_output = self.filter_pooler[filter_idx](outputs['filter_states'][filter_idx])
+                filter_pooled_output = self.filter_dropout[filter_idx](filter_pooled_output)
+                filter_logits.append(self.filter_head[filter_idx](filter_pooled_output))
+
+        loss = None
+        if labels is not None:
+            if self.config.problem_type is None:
+                if self.num_labels == 1:
+                    # regression task
+                    loss_fn = nn.MSELoss()
+                    if not self.config.train_filters:
+                        logits = logits.view(-1).to(labels.dtype)
+                        loss = loss_fn(logits, labels.view(-1))
+                    else:
+                        filter_logits = [logits.view(-1).to(labels.dtype) for logits in filter_logits]
+                        loss = sum([loss_fn(logits, labels.view(-1)) for logits in filter_logits]) / self.num_filters
+                elif labels.dim() == 1 or labels.size(-1) == 1:
+                    label_index = (labels >= 0).nonzero()
+                    labels = labels.long()
+                    if label_index.size(0) > 0:
+                        loss_fct = CrossEntropyLoss()
+                        labels = torch.gather(labels, 0, label_index.view(-1))
+                        if not self.config.train_filters:
+                            labeled_logits = torch.gather(
+                                logits, 0, label_index.expand(label_index.size(0), logits.size(1))
+                            )
+                            loss = loss_fct(labeled_logits.view(-1, self.num_labels).float(), labels.view(-1))
+                        else:
+                            labeled_logits = [torch.gather(
+                                logits, 0, label_index.expand(label_index.size(0), logits.size(1))
+                            ) for logits in filter_logits]
+                            loss = sum([loss_fct(
+                                logits.view(-1, self.num_labels).float(), labels.view(-1)
+                            ) for logits in labeled_logits]) / self.num_filters
+                    else:
+                        loss = torch.tensor(0).to(logits)   
+                else:
+                    log_softmax = nn.LogSoftmax(-1)
+                    if not self.config.train_filters:
+                        loss = -((log_softmax(logits) * labels).sum(-1)).mean()
+                    else:
+                        loss = sum([-((log_softmax(logits) * labels).sum(-1)).mean() for logits in filter_logits]) / self.num_filters 
+            elif self.config.problem_type == "regression":
+                loss_fct = MSELoss()
+                if self.num_labels == 1:
+                    if not self.config.train_filters:
+                        loss = loss_fct(logits.squeeze(), labels.squeeze())
+                    else:
+                        loss = sum([loss_fct(logits.squeeze(), labels.squeeze()) for logits in filter_logits]) / self.num_filters
+                else:
+                    if not self.config.train_filters:
+                        loss = loss_fct(logits, labels)
+                    else:
+                        loss = sum([loss_fct(logits, labels) for logits in filter_logits]) / self.num_filters
+            elif self.config.problem_type == "single_label_classification":
+                loss_fct = CrossEntropyLoss()
+                if not self.config.train_filters:
+                    loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+                else:
+                    loss = sum([loss_fct(logits.view(-1, self.num_labels), labels.view(-1)) for logits in filter_logits]) / self.num_filters
+            elif self.config.problem_type == "multi_label_classification":
+                loss_fct = BCEWithLogitsLoss()
+                if not self.config.train_filters:
+                    loss = loss_fct(logits, labels)
+                else:
+                    loss = sum([loss_fct(logits, labels) for logits in filter_logits]) / self.num_filters
+
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return ((loss,) + output) if loss is not None else output
+
+        return TEDSequenceClassifierOutput(
+            loss=loss, 
+            logits=logits, 
+            hidden_states=outputs.hidden_states, 
             attentions=outputs.attentions,
             filter_states=outputs.filter_states,
         )

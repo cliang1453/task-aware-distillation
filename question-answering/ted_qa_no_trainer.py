@@ -139,19 +139,7 @@ def parse_args():
         "--model_name_or_path",
         type=str,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
-        required=False,
-    )
-    parser.add_argument(
-        "--config_name",
-        type=str,
-        default=None,
-        help="Pretrained config name or path if not the same as model_name",
-    )
-    parser.add_argument(
-        "--tokenizer_name",
-        type=str,
-        default=None,
-        help="Pretrained tokenizer name or path if not the same as model_name",
+        required=True,
     )
     parser.add_argument(
         "--use_slow_tokenizer",
@@ -312,19 +300,18 @@ def parse_args():
             'Whether or not to use mixed precision training (fp16 or bfloat16). Choose from `"no"`,`"fp16"`,`"bf16"`.'
         )
     )
+    parser.add_argument(
+        "--save_best",
+        action="store_true",
+        help="Whether or not to save the best evaluated checkpoint.",
+    )
 
     ##### TED Parameters #####
-    parser.add_argument(
-        "--teacher_config_name",
-        type=str,
-        default=None,
-        help="Pretrained config name or path if not the same as model_name",
-    )
     parser.add_argument(
         "--teacher_model_name_or_path",
         type=str,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
-        required=False,
+        required=True,
     )
     parser.add_argument(
         "--checkpoint_path",
@@ -368,7 +355,11 @@ def parse_args():
     parser.add_argument(
         "--filter_nonlinear", 
         action="store_true", 
-        help="whether to add a non-linear activation in each filter.") 
+        help="whether to add a non-linear activation in each filter.")
+    parser.add_argument(
+        "--filter_disabled",
+        action="store_true",
+        help="If disabled, the layerwise MSE loss will be computed between the teacher's original hidden state and the student's filtered hidden state with a randomly initialized filter for dimension matching. This falls back to the standard layerwise distillation. Further setting mse_alpha = 0 falls back to the standard knowledge distillation.")
     ##########################
 
     args = parser.parse_args()
@@ -484,99 +475,99 @@ def main():
     # download model & vocab.
     config_class = CONFIG_MAPPING[args.model_type]
     model_class = MODEL_MAPPING.get(config_class, default=None)
+    # kd: filter_disabled = true, mse_alpha = 0
+    # lwd: filter_disabled = true, mse_alpha > 0
+    # ted: filter_disabled = false, mse_alpha > 0
+    if args.mse_alpha == 0:
+        args.filter_disabled = True # make sure filter_disabled is set to true when mse_alpha is 0.
     
-    if args.config_name:
-        config = config_class.from_pretrained(
-            args.config_name,
-            filter_interval=args.filter_interval,
-            filter_output_dim=args.filter_output_dim,
-            filter_nonlinear=args.filter_nonlinear
-        ) 
-    elif args.model_name_or_path:
-        config = config_class.from_pretrained(
-            args.model_name_or_path,
-            filter_interval=args.filter_interval,
-            filter_output_dim=args.filter_output_dim,
-            filter_nonlinear=args.filter_nonlinear
-        )
-    else:
-        logger.warning("You are instantiating a new student config instance from scratch.")
-        config = config_class()
+    teacher_config = config_class.from_pretrained(
+        args.teacher_model_name_or_path,
+        train_filters=False,
+        filter_interval=args.teacher_filter_interval,
+        filter_output_dim=args.filter_output_dim,
+        filter_nonlinear=args.filter_nonlinear,
+        filter_disabled=args.filter_disabled, # need no filters in kd and lwd.
+    )
 
-    if args.teacher_config_name:
-        teacher_config = config_class.from_pretrained(
-            args.teacher_config_name,
-            filter_interval=args.teacher_filter_interval,
-            filter_output_dim=args.filter_output_dim,
-            filter_nonlinear=args.filter_nonlinear
-        ) 
-    elif args.teacher_model_name_or_path:
-        teacher_config = config_class.from_pretrained(
-            args.teacher_model_name_or_path,
-            filter_interval=args.teacher_filter_interval,
-            filter_output_dim=args.filter_output_dim,
-            filter_nonlinear=args.filter_nonlinear
-        )
-    else:
-        logger.warning("You are instantiating a new teacher config instance from scratch.")
-        teacher_config = config_class()
-        
+    if args.filter_disabled and args.mse_alpha > 0: 
+        args.filter_output_dim = teacher_config.hidden_size # make sure the student matching the teacher's dim in lwd.
+
+    config = config_class.from_pretrained(
+        args.model_name_or_path,
+        train_filters=False,
+        filter_interval=args.filter_interval,
+        filter_output_dim=args.filter_output_dim,
+        filter_nonlinear=args.filter_nonlinear,
+        filter_disabled=(args.mse_alpha==0), # need no filters in kd.
+    )
+
     assert (config.num_hidden_layers // args.filter_interval) \
             == (teacher_config.num_hidden_layers // args.teacher_filter_interval)
 
-    if args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=True)
-    elif args.model_name_or_path:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
-    else:
-        raise ValueError(
-            "You are instantiating a new tokenizer from scratch. This is not supported by this script. "
-            "You can do it from another script, save it, and load it from here, using --tokenizer_name."
-        )
-    
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
+
     if args.checkpoint_path:
-        logger.info(f"You are conducting TED for student checkpoint in: {args.checkpoint_path}. "
-                    f"If this model does not come with learned filters, the filters will be randomly initialized.")
+        if not args.filter_disabled:
+            logger.info(f"You are conducting TED for student checkpoint in: {args.checkpoint_path}. "
+                        f"Please make sure the model containing learned filters. If not, the filters will be randomly initialized.")
+        elif args.mse_alpha == 0: 
+            logger.info(f"You are conducting KD for student checkpoint in: {args.checkpoint_path}. "
+                        f"No filters will be loaded.")
+        else:
+            logger.info(f"You are conducting LWD for student checkpoint in: {args.checkpoint_path}. "
+                        f"Please make sure the model not containing learned filters as the filters should be randomly initialized.")
         model = model_class.from_pretrained(
             args.checkpoint_path,
             from_tf=bool(".ckpt" in args.checkpoint_path),
             config=config,
         )
-    elif args.model_name_or_path:
-        logger.info(f"You are conducting TED for student: {args.model_name_or_path}. "
-                    f"If this model does not come with learned filters, the filters will be randomly initialized.")
+    else:
+        if not args.filter_disabled:
+            logger.info(f"You are conducting TED for student: {args.model_name_or_path}. "
+                        f"Please make sure the model containing learned filters. If not, the filters will be randomly initialized.")
+        elif args.mse_alpha == 0: 
+            logger.info(f"You are conducting KD for student checkpoint in: {args.model_name_or_path}. "
+                        f"No filters will be loaded.")
+        else: 
+            logger.info(f"You are conducting LWD for student checkpoint in: {args.model_name_or_path}. "
+                        f"Please make sure the model not containing learned filters as the filters should be randomly initialized.")
         model = model_class.from_pretrained(
             args.model_name_or_path,
             from_tf=bool(".ckpt" in args.model_name_or_path),
             config=config,
         )
-    else:
-        logger.warning(f"You are conducting TED for an untrained student. "
-                       f"Both the student and its filters will be randomly initialized.")
-        model = model_class.from_config(config)
-
 
     if args.teacher_checkpoint_path:
-        logger.info(f"You are conducting TED for teacher checkpoint in: {args.teacher_checkpoint_path}. "
-                    f"If this model does not come with learned filters, the filters will be randomly initialized.")
+        if not args.filter_disabled:
+            logger.info(f"You are conducting TED for teacher checkpoint in: {args.teacher_checkpoint_path}. "
+                        f"Please make sure the model containing learned filters. If not, the filters will be randomly initialized.")
+        elif args.mse_alpha == 0: 
+            logger.info(f"You are conducting KD for teacher checkpoint in: {args.teacher_checkpoint_path}. "
+                        f"No filters will be loaded.")
+        else: 
+            logger.info(f"You are conducting LWD for teacher checkpoint in: {args.teacher_checkpoint_path}. "
+                        f"No filters will be loaded.")
         teacher_model = model_class.from_pretrained(
             args.teacher_checkpoint_path,
             from_tf=bool(".ckpt" in args.teacher_checkpoint_path),
-            config=teacher_config,
+            config=teacher_config
         )
-    elif args.teacher_model_name_or_path:
-        logger.info(f"You are conducting TED for teacher: {args.teacher_model_name_or_path}. "
-                    f"If this model does not come with learned filters, the filters will be randomly initialized.")
+    else:
+        if not args.filter_disabled:
+            logger.info(f"You are conducting TED for teacher: {args.teacher_model_name_or_path}. "
+                        f"Please make sure the model containing learned filters. If not, the filters will be randomly initialized.")
+        elif args.mse_alpha == 0: 
+            logger.info(f"You are conducting KD for teacher checkpoint in: {args.teacher_model_name_or_path}. "
+                        f"No filters will be loaded.")
+        else: 
+            logger.info(f"You are conducting LWD for teacher checkpoint in: {args.teacher_model_name_or_path}. "
+                        f"No filters will be loaded.")
         teacher_model = model_class.from_pretrained(
             args.teacher_model_name_or_path,
             from_tf=bool(".ckpt" in args.teacher_model_name_or_path),
-            config=teacher_config,
+            config=teacher_config
         )
-    else:
-        logger.warning(f"You are conducting TED using an untrained teacher. "
-                       f"Both the teacher and its filters will be randomly initialized.")
-        teacher_model = model_class.from_config(teacher_config)
-    
 
     # Preprocessing the datasets.
     # Preprocessing is slighlty different for training and evaluation.
@@ -975,6 +966,7 @@ def main():
             resume_step -= starting_epoch * len(train_dataloader)
     
     teacher_model.eval()
+    best_eval = 0 if args.save_best else None
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
 
@@ -991,7 +983,7 @@ def main():
                 outputs = model(**batch)
                 with torch.no_grad():
                     batch = batch.to(next(teacher_model.parameters()).device)
-                    teacher_outputs = teacher_model(**batch)
+                    teacher_outputs = teacher_model(**batch, output_hidden_states=(args.mse_alpha > 0 and args.filter_disabled)) # output_hidden_states is set to True in lwd.
                 
                 kl_loss = 0.0
                 if args.kl_alpha > 0:
@@ -1011,8 +1003,12 @@ def main():
                 
                 mse_loss = 0.0
                 if args.mse_alpha > 0:
-                    
-                    for state, teacher_state in zip(outputs.filter_states, teacher_outputs.filter_states):
+                    if not args.filter_disabled:
+                        teacher_states = teacher_outputs.filter_states
+                    else:
+                        teacher_states = teacher_outputs.hidden_states[1:]
+                        teacher_states = [teacher_states[(i+1) * args.teacher_filter_interval - 1] for i in range(teacher_config.num_hidden_layers // args.teacher_filter_interval)]
+                    for state, teacher_state in zip(outputs.filter_states, teacher_states):
                         mse_loss += F.mse_loss(
                             state, teacher_state.detach(), reduction="mean"
                         ) # torch.mean((state - teacher_state)**2)
@@ -1062,42 +1058,59 @@ def main():
                     commit_message=f"Training in progress epoch {epoch}", blocking=False, auto_lfs_prune=True
                 )
 
-    # Evaluation
-    logger.info("***** Running Evaluation *****")
-    logger.info(f"  Num examples = {len(eval_dataset)}")
-    logger.info(f"  Batch size = {args.per_device_eval_batch_size}")
+        # Evaluation
+        logger.info("***** Running Evaluation *****")
+        logger.info(f"  Num examples = {len(eval_dataset)}")
+        logger.info(f"  Batch size = {args.per_device_eval_batch_size}")
 
-    all_start_logits = []
-    all_end_logits = []
+        all_start_logits = []
+        all_end_logits = []
 
-    model.eval()
-    for step, batch in enumerate(eval_dataloader):
-        with torch.no_grad():
-            outputs = model(**batch)
-            start_logits = outputs.start_logits
-            end_logits = outputs.end_logits
+        model.eval()
+        for step, batch in enumerate(eval_dataloader):
+            with torch.no_grad():
+                outputs = model(**batch)
+                start_logits = outputs.start_logits
+                end_logits = outputs.end_logits
 
-            if not args.pad_to_max_length:  # necessary to pad predictions and labels for being gathered
-                start_logits = accelerator.pad_across_processes(start_logits, dim=1, pad_index=-100)
-                end_logits = accelerator.pad_across_processes(end_logits, dim=1, pad_index=-100)
+                if not args.pad_to_max_length:  # necessary to pad predictions and labels for being gathered
+                    start_logits = accelerator.pad_across_processes(start_logits, dim=1, pad_index=-100)
+                    end_logits = accelerator.pad_across_processes(end_logits, dim=1, pad_index=-100)
 
-            all_start_logits.append(accelerator.gather_for_metrics(start_logits).cpu().numpy())
-            all_end_logits.append(accelerator.gather_for_metrics(end_logits).cpu().numpy())
+                all_start_logits.append(accelerator.gather_for_metrics(start_logits).cpu().numpy())
+                all_end_logits.append(accelerator.gather_for_metrics(end_logits).cpu().numpy())
 
-    max_len = max([x.shape[1] for x in all_start_logits])  # Get the max_length of the tensor
+        max_len = max([x.shape[1] for x in all_start_logits])  # Get the max_length of the tensor
 
-    # concatenate the numpy array
-    start_logits_concat = create_and_fill_np_array(all_start_logits, eval_dataset, max_len)
-    end_logits_concat = create_and_fill_np_array(all_end_logits, eval_dataset, max_len)
+        # concatenate the numpy array
+        start_logits_concat = create_and_fill_np_array(all_start_logits, eval_dataset, max_len)
+        end_logits_concat = create_and_fill_np_array(all_end_logits, eval_dataset, max_len)
 
-    # delete the list of numpy arrays
-    del all_start_logits
-    del all_end_logits
+        # delete the list of numpy arrays
+        del all_start_logits
+        del all_end_logits
 
-    outputs_numpy = (start_logits_concat, end_logits_concat)
-    prediction = post_processing_function(eval_examples, eval_dataset, outputs_numpy)
-    eval_metric = metric.compute(predictions=prediction.predictions, references=prediction.label_ids)
-    logger.info(f"Evaluation metrics: {eval_metric}")
+        outputs_numpy = (start_logits_concat, end_logits_concat)
+        prediction = post_processing_function(eval_examples, eval_dataset, outputs_numpy)
+        eval_metric = metric.compute(predictions=prediction.predictions, references=prediction.label_ids)
+        logger.info(f"Evaluation metrics: {eval_metric}")
+        
+        if args.save_best:
+            if eval_metric['f1'] > best_eval:
+                best_eval = eval_metric['f1']
+                if args.output_dir is not None:
+                    accelerator.wait_for_everyone()
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    unwrapped_model.save_pretrained(
+                        args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
+                    )
+                    if accelerator.is_main_process:
+                        tokenizer.save_pretrained(args.output_dir)
+                        if args.push_to_hub:
+                            repo.push_to_hub(commit_message="End of training", auto_lfs_prune=True)
+
+                        logger.info(json.dumps(eval_metric, indent=4))
+                        save_prefixed_metrics(eval_metric, args.output_dir)
 
     # Prediction
     if args.do_predict:
@@ -1149,7 +1162,7 @@ def main():
 
         accelerator.log(log, step=completed_steps)
 
-    if args.output_dir is not None:
+    if args.output_dir is not None and not args.save_best:
         accelerator.wait_for_everyone()
         unwrapped_model = accelerator.unwrap_model(model)
         unwrapped_model.save_pretrained(

@@ -25,6 +25,7 @@ class TEDDebertaV2Config(DebertaV2Config):
         filter_interval=1,
         filter_output_dim=None, 
         filter_nonlinear=False,
+        filter_disabled=False,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -33,3 +34,4 @@ class TEDDebertaV2Config(DebertaV2Config):
         self.filter_interval = filter_interval
         self.filter_output_dim = filter_output_dim
         self.filter_nonlinear = filter_nonlinear
+        self.filter_disabled = filter_disabled
